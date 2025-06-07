@@ -5,6 +5,9 @@ import { JSONRPCMessage, isInitializeRequest } from '@modelcontextprotocol/sdk/t
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { HttpStreamTransportConfig } from './types.js';
 import { logger } from '../../core/Logger.js';
+import { APIKeyAuthProvider } from '../../auth/providers/apikey.js';
+import { DEFAULT_AUTH_ERROR } from '../../auth/types.js';
+import { getRequestHeader } from '../../utils/headers.js';
 
 export class HttpStreamTransport extends AbstractTransport {
   readonly type = 'http-stream';
@@ -15,6 +18,7 @@ export class HttpStreamTransport extends AbstractTransport {
   private _endpoint: string;
   private _enableJsonResponse: boolean = false;
   private _sessionInitialized: boolean = false;
+  private _config: HttpStreamTransportConfig;
 
   private _pingInterval?: NodeJS.Timeout;
   private _pingTimeouts: Map<string | number, NodeJS.Timeout> = new Map();
@@ -24,6 +28,7 @@ export class HttpStreamTransport extends AbstractTransport {
   constructor(config: HttpStreamTransportConfig = {}) {
     super();
 
+    this._config = config;
     this._port = config.port || 8080;
     this._endpoint = config.endpoint || '/mcp';
     this._enableJsonResponse = config.responseMode === 'batch';
@@ -40,7 +45,10 @@ export class HttpStreamTransport extends AbstractTransport {
         responseMode: config.responseMode,
         batchTimeout: config.batchTimeout,
         maxMessageSize: config.maxMessageSize,
-        auth: config.auth ? true : false,
+        auth: config.auth ? {
+          provider: config.auth.provider?.constructor.name,
+          endpoints: config.auth.endpoints
+        } : undefined,
         cors: config.cors ? true : false,
         ping: {
           frequency: this._pingFrequency,
@@ -48,6 +56,51 @@ export class HttpStreamTransport extends AbstractTransport {
         },
       })}`
     );
+  }
+
+  private async handleAuthentication(req: IncomingMessage, res: ServerResponse, context: string): Promise<boolean> {
+    if (!this._config.auth?.provider) {
+      return true;
+    }
+
+    const isApiKey = this._config.auth.provider instanceof APIKeyAuthProvider;
+    if (isApiKey) {
+      const provider = this._config.auth.provider as APIKeyAuthProvider;
+      const headerValue = getRequestHeader(req.headers, provider.getHeaderName());
+
+      if (!headerValue) {
+        const error = provider.getAuthError?.() || DEFAULT_AUTH_ERROR;
+        res.setHeader("WWW-Authenticate", `ApiKey realm="MCP Server", header="${provider.getHeaderName()}"`);
+        res.writeHead(error.status).end(JSON.stringify({
+          error: error.message,
+          status: error.status,
+          type: "authentication_error"
+        }));
+        return false;
+      }
+    }
+
+    const authResult = await this._config.auth.provider.authenticate(req);
+    if (!authResult) {
+      const error = this._config.auth.provider.getAuthError?.() || DEFAULT_AUTH_ERROR;
+      logger.warn(`Authentication failed for ${context}:`);
+      logger.warn(`- Error: ${error.message}`);
+
+      if (isApiKey) {
+        const provider = this._config.auth.provider as APIKeyAuthProvider;
+        res.setHeader("WWW-Authenticate", `ApiKey realm="MCP Server", header="${provider.getHeaderName()}"`);
+      }
+
+      res.writeHead(error.status).end(JSON.stringify({
+        error: error.message,
+        status: error.status,
+        type: "authentication_error"
+      }));
+      return false;
+    }
+
+    logger.info(`Authentication successful for ${context}: ${req.socket.remoteAddress}`);
+    return true;
   }
 
   private createSdkTransport(): StreamableHTTPServerTransport {
@@ -82,6 +135,12 @@ export class HttpStreamTransport extends AbstractTransport {
           const url = new URL(req.url!, `http://${req.headers.host}`);
 
           if (url.pathname === this._endpoint) {
+            // Handle authentication if configured
+            if (this._config.auth?.provider) {
+              const isAuthenticated = await this.handleAuthentication(req, res, "HTTP request");
+              if (!isAuthenticated) return;
+            }
+
             // Special handling for POST requests to detect initialization requests
             if (req.method === 'POST') {
               const contentType = req.headers['content-type'];
